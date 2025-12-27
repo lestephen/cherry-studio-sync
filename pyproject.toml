@@ -1,0 +1,17 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2025 Stephen Le
+
+[project]
+name = "cherry-studio-sync"
+version = "1.0.0"
+description = "Sync Cherry Studio data across multiple computers"
+requires-python = ">=3.10"
+dependencies = [
+    "pyside6>=6.5.0,<6.8",
+]
+
+[project.scripts]
+cherry-studio-sync = "cherry_studio_sync:main"

@@ -2,7 +2,6 @@
 
 Sync your Cherry Studio data across multiple computers and operating systems.
 
-![License](https://img.shields.io/badge/license-MPL%202.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
@@ -42,34 +41,31 @@ Cherry Studio doesn't sync between devices. When you restore a backup from one c
 ### What Gets Synced (Shared Between Computers)
 - Assistants and their topics
 - Conversation messages
-- Knowledge base entries
 - Notes and memory
 
 ### What Stays Machine-Specific
 - Settings (paths, preferences)
 - Backup configuration
 - Keyboard shortcuts
+- Knowledge bases (excluded by default, see Known Issues)
 
 ---
 
 ## 📋 Requirements
 
 - Python 3.10+
+- PySide6 (installed automatically when using `uv` or `pip install -r requirements.txt`)
 - Cherry Studio backup files following the naming convention:
   ```
   cherry-studio.<timestamp>.<hostname>.<os>.zip
   ```
   Example: `cherry-studio.20251221172647.my-desktop.windows.zip`
 
-**Note for Linux users:** You may need to install tkinter separately:
-- Ubuntu/Debian: `sudo apt-get install python3-tk`
-- Fedora: `sudo dnf install python3-tkinter`
-
 ---
 
 ## 🚀 Usage
 
-### GUI Mode (Recommended for beginners)
+### GUI Mode (Recommended)
 
 The easiest way to use this tool is with the graphical interface:
 
@@ -82,13 +78,20 @@ The easiest way to use this tool is with the graphical interface:
 python cherry_studio_sync.py --gui
 ```
 
+**Using uv (recommended):**
+```bash
+uv run cherry_studio_sync.py --gui
+```
+
 The GUI provides:
 - A directory browser to select your backup folder
-- A checkbox for the "merge all" option
+- Option to merge all backups (not just latest per computer)
+- **Skip Knowledge Bases** checkbox (enabled by default) - excludes large KB files from merged backups
+- **Prune old merged backups** option - automatically delete old merged backups, keeping only the most recent per computer
 - A status log showing progress
 - Success/error dialogs when complete
 
-### Command Line Usage (Advanced)
+### Command Line Usage
 
 #### Basic Usage
 
@@ -109,6 +112,22 @@ To include all backups (not just the latest from each computer):
 
 ```bash
 python cherry_studio_sync.py --all
+```
+
+#### Include Knowledge Bases
+
+By default, Knowledge Base files are excluded from merged backups. To include them:
+
+```bash
+python cherry_studio_sync.py --include-knowledge-base
+```
+
+#### Prune Old Merged Backups
+
+To automatically delete old merged backups, keeping only the N most recent per computer:
+
+```bash
+python cherry_studio_sync.py --prune 2
 ```
 
 #### Specify Backup Files
@@ -162,11 +181,28 @@ Both machines now have all conversations with their respective settings preserve
 
 ---
 
+## ⚠️ Known Issues
+
+### Knowledge Base Restore Failure
+
+There is a [known issue in Cherry Studio](https://github.com/kangfenmao/cherry-studio/issues/12160) where restoring a backup fails with "backup format error" when a Knowledge Base is in use. The actual error is that the KnowledgeBase file is locked by the running application.
+
+**Workarounds:**
+
+1. **Use Slim Backups** (Recommended): In Cherry Studio's backup settings, enable "Slim Backup" which excludes media and knowledge bases. This sync tool handles slim backups correctly.
+
+2. **Skip Knowledge Bases in Sync**: This tool excludes Knowledge Bases from merged backups by default (`--skip-knowledge-base` is enabled). This avoids the restore issue entirely.
+
+3. **Delete Knowledge Bases Before Restore**: Use Cherry Studio's UI to delete all knowledge bases before restoring a merged backup.
+
+---
+
 ## ⚠️ Limitations
 
 - Backup files must follow Cherry Studio's naming convention
 - Requires at least 2 computers' backups to sync
 - Settings sync is intentionally disabled (paths differ between OS)
+- Knowledge bases are excluded by default due to restore issues
 
 ---
 
@@ -180,26 +216,25 @@ The launcher scripts check for Python in common locations. If Python isn't found
 2. **Ensure Python is in your PATH:**
    - Windows: Check "Add Python to PATH" during installation
    - Mac/Linux: Usually automatic with package managers
-3. **Alternative:** Install via [uv](https://docs.astral.sh/uv/) or [conda](https://conda.io)
+3. **Alternative:** Install via [uv](https://docs.astral.sh/uv/) (recommended) or [conda](https://conda.io)
 
-### "tkinter is not available" (Linux)
+### "PySide6 is not available"
 
-On some Linux distributions, tkinter is not included by default:
+Install the GUI dependency:
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install python3-tk
-
-# Fedora
-sudo dnf install python3-tkinter
-
-# Arch Linux
-sudo pacman -S tk
+pip install pyside6
+# or with uv:
+uv pip install pyside6
 ```
 
-### GUI window doesn't appear (Mac)
+### PySide6 DLL errors on Windows
 
-On macOS, you may need to grant terminal/Python permission to control the computer in System Preferences > Security & Privacy > Privacy > Accessibility.
+If you see DLL load errors with PySide6, try installing an older version:
+
+```bash
+pip install "pyside6>=6.5.0,<6.8"
+```
 
 ---
 

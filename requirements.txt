@@ -1,6 +1,5 @@
-# No external dependencies required
-# Python 3.10+ with tkinter (included in standard Python installations)
-#
-# Note: On some Linux distributions, tkinter may need to be installed separately:
-#   Ubuntu/Debian: sudo apt-get install python3-tk
-#   Fedora: sudo dnf install python3-tkinter
+# Cherry Studio Sync dependencies
+# Install with: pip install -r requirements.txt
+# Or use uv: uv pip install -r requirements.txt
+
+pyside6>=6.5.0,<6.8

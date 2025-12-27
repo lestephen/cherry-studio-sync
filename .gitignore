@@ -25,3 +25,9 @@ Thumbs.db
 
 # Backup files (prevent committing personal data)
 *.zip
+
+# uv lock file (environment-specific)
+uv.lock
+
+# Temp folders
+temp_*/
