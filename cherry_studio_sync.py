@@ -50,6 +50,29 @@ MACHINE_SPECIFIC_KEYS = {'settings', 'backup', 'shortcuts'}
 # Keys that contain shareable data (conversations, etc.)
 DATA_KEYS = {'assistants', 'knowledge', 'memory', 'paintings', 'note'}
 
+# Config file location
+CONFIG_DIR = Path.home() / ".cherry-studio-sync"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config() -> dict:
+    """Load configuration from file, returning defaults if not found."""
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_config(config: dict) -> None:
+    """Save configuration to file."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    except OSError:
+        pass
+
 
 def migrate_assistants_format(assistants_data: dict) -> dict:
     """Migrate old backup format to new format by adding missing fields.
@@ -658,6 +681,13 @@ class MergeGUI:
         from PySide6.QtCore import Qt, QThread, Signal, QObject
         from PySide6.QtGui import QIcon
 
+        # Create signal class for thread-safe GUI updates
+        class WorkerSignals(QObject):
+            log_message = Signal(str)
+            finished = Signal(bool, object)
+
+        self.signals = WorkerSignals()
+
         self.QApplication = QApplication
         self.QMainWindow = QMainWindow
         self.QWidget = QWidget
@@ -690,7 +720,12 @@ class MergeGUI:
             self.window.setWindowIcon(QIcon(str(icon_path)))
 
         self.is_merging = False
+        self.config = load_config()
         self._setup_ui()
+
+        # Connect signals to slots for thread-safe GUI updates
+        self.signals.log_message.connect(self._log_slot)
+        self.signals.finished.connect(self._finish_merge)
 
     def _setup_ui(self):
         """Set up the user interface components."""
@@ -703,7 +738,8 @@ class MergeGUI:
         layout.addWidget(self.QLabel("Backup Directory:"))
 
         dir_layout = self.QHBoxLayout()
-        self.dir_entry = self.QLineEdit(str(Path.cwd()))
+        initial_dir = self.config.get("last_directory", str(Path.cwd()))
+        self.dir_entry = self.QLineEdit(initial_dir)
         dir_layout.addWidget(self.dir_entry)
 
         browse_btn = self.QPushButton("Browse...")
@@ -770,9 +806,17 @@ class MergeGUI:
         if directory:
             self.dir_entry.setText(directory)
 
-    def _log(self, message: str):
-        """Append a message to the log area (thread-safe via signal)."""
+    def _log_slot(self, message: str):
+        """Slot: Append a message to the log area (called on main thread)."""
         self.log_text.append(message)
+
+    def _emit_log(self, message: str):
+        """Emit a log message signal (thread-safe, can be called from any thread)."""
+        self.signals.log_message.emit(message)
+
+    def _emit_finished(self, success: bool, output_files: list):
+        """Emit finished signal (thread-safe, can be called from any thread)."""
+        self.signals.finished.emit(success, output_files)
 
     def _clear_log(self):
         """Clear the log area."""
@@ -794,7 +838,7 @@ class MergeGUI:
         prune_count = self.prune_spin.value() if self.prune_cb.isChecked() else None
 
         worker = MergeWorker(directory, merge_all, skip_kb, prune_count,
-                           self._log, self._finish_merge)
+                           self._emit_log, self._emit_finished)
         thread = threading.Thread(target=worker.run, daemon=True)
         thread.start()
 
@@ -807,23 +851,23 @@ class MergeGUI:
         keep_count = self.prune_spin.value()
 
         self._clear_log()
-        self._log("Pruning merged backups...")
-        self._log(f"Directory: {directory}")
-        self._log(f"Keeping: {keep_count} per computer")
-        self._log("")
+        self._log_slot("Pruning merged backups...")
+        self._log_slot(f"Directory: {directory}")
+        self._log_slot(f"Keeping: {keep_count} per computer")
+        self._log_slot("")
 
         merged = discover_merged_backups(directory)
         if not merged:
-            self._log("No merged backups found.")
+            self._log_slot("No merged backups found.")
             return
 
         deleted = prune_merged_backups(directory, keep_count)
         if deleted:
-            self._log(f"Deleted {len(deleted)} old merged backup(s):")
+            self._log_slot(f"Deleted {len(deleted)} old merged backup(s):")
             for f in deleted:
-                self._log(f"  - {f.name}")
+                self._log_slot(f"  - {f.name}")
         else:
-            self._log("No merged backups needed pruning.")
+            self._log_slot("No merged backups needed pruning.")
 
         self.QMessageBox.information(
             self.window,
@@ -838,6 +882,8 @@ class MergeGUI:
         self.prune_only_btn.setEnabled(True)
 
         if success and output_files:
+            self.config["last_directory"] = self.dir_entry.text()
+            save_config(self.config)
             self.QMessageBox.information(
                 self.window,
                 "Sync Complete",
