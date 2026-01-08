@@ -55,14 +55,51 @@ CONFIG_DIR = Path.home() / ".cherry-studio-sync"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
+DELETED_ITEM_EXPIRY_DAYS = 90
+
+
+def _expire_deleted_items(deleted_dict: dict, expiry_days: int) -> list:
+    """Remove entries older than expiry_days. Returns list of expired IDs."""
+    if not deleted_dict:
+        return []
+    now = datetime.now()
+    expired = []
+    for item_id, timestamp_str in list(deleted_dict.items()):
+        try:
+            deleted_at = datetime.fromisoformat(timestamp_str)
+            if (now - deleted_at).days > expiry_days:
+                expired.append(item_id)
+        except (ValueError, TypeError):
+            expired.append(item_id)  # Invalid timestamp, remove it
+    for item_id in expired:
+        del deleted_dict[item_id]
+    return expired
+
+
 def load_config() -> dict:
-    """Load configuration from file, returning defaults if not found."""
+    """Load configuration from file, returning defaults if not found.
+
+    Also expires deleted_assistants and deleted_topics entries older than DELETED_ITEM_EXPIRY_DAYS.
+    """
+    config = {}
     try:
         if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text())
+            config = json.loads(CONFIG_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         pass
-    return {}
+
+    # Expire old deleted entries
+    need_save = False
+    for key in ("deleted_assistants", "deleted_topics"):
+        deleted = config.get(key, {})
+        if _expire_deleted_items(deleted, DELETED_ITEM_EXPIRY_DAYS):
+            config[key] = deleted
+            need_save = True
+
+    if need_save:
+        save_config(config)
+
+    return config
 
 
 def save_config(config: dict) -> None:
@@ -279,19 +316,27 @@ def extract_backup(zip_path: str, temp_dir: str) -> dict:
 
 
 def merge_by_id(older: list, newer: list, id_key: str = "id",
-                time_key: str = None, stats: dict = None) -> list:
+                time_key: str = None, stats: dict = None,
+                deleted_ids: set = None) -> tuple[list, list]:
     """
     Merge two lists of objects by ID.
     Items from newer take precedence.
-    Items only in older are skipped (orphan deletion strategy).
+    Items only in older are returned as orphans (unless in deleted_ids).
+
+    Returns:
+        tuple: (merged_result, orphans)
     """
+    if deleted_ids is None:
+        deleted_ids = set()
+
     newer_ids = {item.get(id_key) for item in newer if item.get(id_key)}
     older_ids = {item.get(id_key) for item in older if item.get(id_key)}
 
     # Build result from newer items
     result = {item.get(id_key): item for item in newer if item.get(id_key)}
+    orphans = []
 
-    # Add items from older that also exist in newer (merge conflicts)
+    # Process items from older
     for item in older:
         item_id = item.get(id_key)
         if not item_id:
@@ -300,23 +345,41 @@ def merge_by_id(older: list, newer: list, id_key: str = "id",
         if item_id in newer_ids:
             if stats:
                 stats["conflicts"] += 1
-        else:
+        elif item_id in deleted_ids:
+            # Previously marked as deleted by user
             if stats:
                 stats["skipped_orphans"] += 1
+        else:
+            # Orphan - needs user decision
+            orphans.append(copy.deepcopy(item))
 
     new_only = newer_ids - older_ids
     if stats:
         stats["new_items"] += len(new_only)
 
-    return list(result.values())
+    return list(result.values()), orphans
 
 
-def merge_assistants(older_data: dict, newer_data: dict, stats: dict) -> dict:
+def merge_assistants(older_data: dict, newer_data: dict, stats: dict,
+                     deleted_assistant_ids: set = None,
+                     deleted_topic_ids: set = None) -> tuple[dict, list, list]:
     """Merge assistant structures, including nested topics.
 
     Preserves all top-level keys (presets, tagsOrder, collapsedTags, etc.)
     while applying special merge logic only to the assistants array.
+
+    Returns:
+        tuple: (merged_result, orphan_assistants, orphan_topics)
+            - merged_result: The merged assistants data
+            - orphan_assistants: List of assistants that exist only in older backup
+            - orphan_topics: List of dicts with topic + assistant context:
+              {"topic": {...}, "assistant_id": "...", "assistant_name": "..."}
     """
+    if deleted_assistant_ids is None:
+        deleted_assistant_ids = set()
+    if deleted_topic_ids is None:
+        deleted_topic_ids = set()
+
     # Migrate both inputs to ensure they have all required fields
     older_data = migrate_assistants_format(older_data)
     newer_data = migrate_assistants_format(newer_data)
@@ -335,6 +398,8 @@ def merge_assistants(older_data: dict, newer_data: dict, stats: dict) -> dict:
 
     newer_ids = {a.get("id") for a in newer_assistants}
     merged_assistants = {}
+    orphan_assistants = []
+    orphan_topics = []
 
     for asst in newer_assistants:
         asst_id = asst.get("id")
@@ -343,8 +408,17 @@ def merge_assistants(older_data: dict, newer_data: dict, stats: dict) -> dict:
 
     for old_asst in older_assistants:
         asst_id = old_asst.get("id")
-        if not asst_id or asst_id not in newer_ids:
-            stats["skipped_orphans"] += 1
+        asst_name = old_asst.get("name", "Unknown Assistant")
+        if not asst_id:
+            continue
+        if asst_id not in newer_ids:
+            # Assistant only exists in older backup
+            if asst_id in deleted_assistant_ids:
+                # Previously marked as deleted by user, skip it
+                stats["skipped_orphans"] += 1
+            else:
+                # Orphan - needs user decision
+                orphan_assistants.append(copy.deepcopy(old_asst))
             continue
 
         # Merge topics for assistants that exist in both
@@ -352,8 +426,18 @@ def merge_assistants(older_data: dict, newer_data: dict, stats: dict) -> dict:
         old_topics = old_asst.get("topics", [])
         new_topics = new_asst.get("topics", [])
 
-        merged_topics = merge_by_id(old_topics, new_topics, "id", "updatedAt", stats)
+        merged_topics, topic_orphans = merge_by_id(
+            old_topics, new_topics, "id", "updatedAt", stats, deleted_topic_ids
+        )
         merged_assistants[asst_id]["topics"] = merged_topics
+
+        # Add context to orphan topics
+        for topic in topic_orphans:
+            orphan_topics.append({
+                "topic": topic,
+                "assistant_id": asst_id,
+                "assistant_name": new_asst.get("name", asst_name),
+            })
 
     # Update the assistants array in result
     result["assistants"] = list(merged_assistants.values())
@@ -362,13 +446,21 @@ def merge_assistants(older_data: dict, newer_data: dict, stats: dict) -> dict:
     if "defaultAssistant" not in result or not result["defaultAssistant"]:
         result["defaultAssistant"] = older_data.get("defaultAssistant")
 
-    return result
+    return result, orphan_assistants, orphan_topics
 
 
-def merge_persist_data_only(older: dict, newer: dict, stats: dict) -> dict:
-    """Merge only the data portions of persist:cherry-studio (not settings)."""
+def merge_persist_data_only(older: dict, newer: dict, stats: dict,
+                            deleted_assistant_ids: set = None,
+                            deleted_topic_ids: set = None) -> tuple[dict, list, list]:
+    """Merge only the data portions of persist:cherry-studio (not settings).
+
+    Returns:
+        tuple: (merged_result, orphan_assistants, orphan_topics)
+    """
     result = {}
     all_keys = set(older.keys()) | set(newer.keys())
+    all_orphan_assistants = []
+    all_orphan_topics = []
 
     for key in all_keys:
         older_val = older.get(key)
@@ -389,11 +481,15 @@ def merge_persist_data_only(older: dict, newer: dict, stats: dict) -> dict:
                 pass
 
         if key == "assistants":
-            merged_val = merge_assistants(
+            merged_val, asst_orphans, topic_orphans = merge_assistants(
                 older_val if isinstance(older_val, dict) else {},
                 newer_val if isinstance(newer_val, dict) else {},
-                stats
+                stats,
+                deleted_assistant_ids,
+                deleted_topic_ids
             )
+            all_orphan_assistants.extend(asst_orphans)
+            all_orphan_topics.extend(topic_orphans)
             if newer_was_string or older_was_string:
                 result[key] = json.dumps(merged_val)
             else:
@@ -403,7 +499,7 @@ def merge_persist_data_only(older: dict, newer: dict, stats: dict) -> dict:
         else:
             result[key] = older.get(key)
 
-    return result
+    return result, all_orphan_assistants, all_orphan_topics
 
 
 def merge_indexeddb(older: dict, newer: dict, stats: dict) -> dict:
@@ -417,9 +513,10 @@ def merge_indexeddb(older: dict, newer: dict, stats: dict) -> dict:
 
         if isinstance(older_db, list) and isinstance(newer_db, list):
             if db_name == "message_blocks":
-                result[db_name] = merge_by_id(older_db, newer_db, "id", "createdAt", stats)
+                merged, _ = merge_by_id(older_db, newer_db, "id", "createdAt", stats)
             else:
-                result[db_name] = merge_by_id(older_db, newer_db, "id", None, stats)
+                merged, _ = merge_by_id(older_db, newer_db, "id", None, stats)
+            result[db_name] = merged
         elif newer_db:
             result[db_name] = newer_db
         else:
@@ -428,16 +525,22 @@ def merge_indexeddb(older: dict, newer: dict, stats: dict) -> dict:
     return result
 
 
-def merge_all_backups(backup_infos: list, stats: dict) -> tuple[dict, dict]:
+def merge_all_backups(backup_infos: list, stats: dict,
+                      deleted_assistant_ids: set = None,
+                      deleted_topic_ids: set = None) -> tuple[dict, dict, list, list]:
     """
     Merge all backups into unified data, keeping track of per-machine settings.
 
     Returns:
         merged_data: The merged conversation data
         machine_settings: Dict mapping computer_id -> their latest settings
+        orphan_assistants: List of assistants needing user decision
+        orphan_topics: List of topics needing user decision (with assistant context)
     """
     sorted_backups = sorted(backup_infos, key=lambda x: x["timestamp"])
     machine_settings = {}
+    all_orphan_assistants = []
+    all_orphan_topics = []
 
     print(f"\nMerge order (oldest to newest):")
     for i, b in enumerate(sorted_backups):
@@ -475,7 +578,12 @@ def merge_all_backups(backup_infos: list, stats: dict) -> tuple[dict, dict]:
         older_persist_raw = older_local.get("persist:cherry-studio", "{}")
         older_persist = json.loads(older_persist_raw) if isinstance(older_persist_raw, str) else older_persist_raw
 
-        merged_persist = merge_persist_data_only(older_persist, newer_persist, stats)
+        merged_persist, asst_orphans, topic_orphans = merge_persist_data_only(
+            older_persist, newer_persist, stats,
+            deleted_assistant_ids, deleted_topic_ids
+        )
+        all_orphan_assistants.extend(asst_orphans)
+        all_orphan_topics.extend(topic_orphans)
 
         result["localStorage"] = newer_local.copy()
         result["localStorage"]["persist:cherry-studio"] = json.dumps(merged_persist)
@@ -488,7 +596,25 @@ def merge_all_backups(backup_infos: list, stats: dict) -> tuple[dict, dict]:
         result["time"] = newer_data.get("time", result.get("time"))
         result["version"] = newer_data.get("version", result.get("version"))
 
-    return result, machine_settings
+    # Deduplicate orphan assistants by ID
+    seen_asst_ids = set()
+    unique_asst_orphans = []
+    for orphan in all_orphan_assistants:
+        orphan_id = orphan.get("id")
+        if orphan_id and orphan_id not in seen_asst_ids:
+            seen_asst_ids.add(orphan_id)
+            unique_asst_orphans.append(orphan)
+
+    # Deduplicate orphan topics by ID
+    seen_topic_ids = set()
+    unique_topic_orphans = []
+    for orphan in all_orphan_topics:
+        topic_id = orphan["topic"].get("id")
+        if topic_id and topic_id not in seen_topic_ids:
+            seen_topic_ids.add(topic_id)
+            unique_topic_orphans.append(orphan)
+
+    return result, machine_settings, unique_asst_orphans, unique_topic_orphans
 
 
 def apply_machine_settings(merged_data: dict, machine_settings: dict) -> dict:
@@ -556,17 +682,85 @@ def create_output_zip(merged_data: dict, backup_infos: list, output_path: str, t
     return output_path
 
 
+def _add_orphan_assistant_to_merged_cli(merged_data: dict, orphan: dict):
+    """Add an orphan assistant to the merged data (CLI helper)."""
+    local = merged_data.get("localStorage", {})
+    persist_raw = local.get("persist:cherry-studio", "{}")
+    persist = json.loads(persist_raw) if isinstance(persist_raw, str) else persist_raw
+
+    assistants_raw = persist.get("assistants")
+    if assistants_raw:
+        assistants = json.loads(assistants_raw) if isinstance(assistants_raw, str) else assistants_raw
+    else:
+        assistants = {"assistants": []}
+
+    # Add the orphan to the assistants list
+    assistants.setdefault("assistants", []).append(orphan)
+
+    # Save back
+    if isinstance(assistants_raw, str):
+        persist["assistants"] = json.dumps(assistants)
+    else:
+        persist["assistants"] = assistants
+
+    if isinstance(persist_raw, str):
+        local["persist:cherry-studio"] = json.dumps(persist)
+    else:
+        local["persist:cherry-studio"] = persist
+
+    merged_data["localStorage"] = local
+
+
+def _add_orphan_topic_to_merged_cli(merged_data: dict, topic: dict, assistant_id: str):
+    """Add an orphan topic to the specified assistant in merged data (CLI helper)."""
+    local = merged_data.get("localStorage", {})
+    persist_raw = local.get("persist:cherry-studio", "{}")
+    persist = json.loads(persist_raw) if isinstance(persist_raw, str) else persist_raw
+
+    assistants_raw = persist.get("assistants")
+    if not assistants_raw:
+        return  # No assistants to add topic to
+
+    assistants = json.loads(assistants_raw) if isinstance(assistants_raw, str) else assistants_raw
+
+    # Find the assistant and add the topic
+    for asst in assistants.get("assistants", []):
+        if asst.get("id") == assistant_id:
+            asst.setdefault("topics", []).append(topic)
+            break
+
+    # Save back
+    if isinstance(assistants_raw, str):
+        persist["assistants"] = json.dumps(assistants)
+    else:
+        persist["assistants"] = assistants
+
+    if isinstance(persist_raw, str):
+        local["persist:cherry-studio"] = json.dumps(persist)
+    else:
+        local["persist:cherry-studio"] = persist
+
+    merged_data["localStorage"] = local
+
+
 class MergeWorker:
     """Worker class to run merge operation in background thread."""
 
     def __init__(self, directory: Path, merge_all: bool, skip_knowledge_base: bool,
-                 prune_count: int | None, log_callback, finished_callback):
+                 prune_count: int | None, log_callback, finished_callback,
+                 deleted_assistant_ids: set = None, deleted_topic_ids: set = None,
+                 orphan_callback=None, orphan_event=None):
         self.directory = directory
         self.merge_all = merge_all
         self.skip_knowledge_base = skip_knowledge_base
         self.prune_count = prune_count
         self.log = log_callback
         self.finished = finished_callback
+        self.deleted_assistant_ids = deleted_assistant_ids or set()
+        self.deleted_topic_ids = deleted_topic_ids or set()
+        self.orphan_callback = orphan_callback  # Called with (asst_orphans, topic_orphans)
+        self.orphan_event = orphan_event  # Event to wait on after orphan_callback
+        self.orphan_response = {}  # Will be set by GUI: {"keep_assistants": [...], "keep_topics": [...]}
 
     def run(self):
         """Execute the merge operation."""
@@ -629,7 +823,35 @@ class MergeWorker:
 
                 # Merge all data
                 self.log("\nMerging data...")
-                merged_data, machine_settings = merge_all_backups(backup_infos, stats)
+                merged_data, machine_settings, asst_orphans, topic_orphans = merge_all_backups(
+                    backup_infos, stats,
+                    self.deleted_assistant_ids, self.deleted_topic_ids
+                )
+
+                # Handle orphans (exist in one backup but not another)
+                has_orphans = asst_orphans or topic_orphans
+                if has_orphans and self.orphan_callback and self.orphan_event:
+                    self.log(f"\nFound {len(asst_orphans)} assistant(s) and {len(topic_orphans)} conversation(s) needing review...")
+                    self.orphan_callback(asst_orphans, topic_orphans)
+                    self.orphan_event.wait()  # Wait for GUI to make decisions
+
+                    # Apply user decisions for assistants
+                    keep_asst_ids = set(self.orphan_response.get("keep_assistants", []))
+                    for orphan in asst_orphans:
+                        if orphan.get("id") in keep_asst_ids:
+                            self._add_orphan_assistant_to_merged(merged_data, orphan)
+                            self.log(f"  Keeping assistant: {orphan.get('name', orphan.get('id', 'Unknown'))}")
+
+                    # Apply user decisions for topics
+                    keep_topic_ids = set(self.orphan_response.get("keep_topics", []))
+                    for orphan_info in topic_orphans:
+                        topic = orphan_info["topic"]
+                        if topic.get("id") in keep_topic_ids:
+                            self._add_orphan_topic_to_merged(
+                                merged_data, topic, orphan_info["assistant_id"]
+                            )
+                            topic_name = topic.get("name", topic.get("id", "Unknown"))
+                            self.log(f"  Keeping conversation: {topic_name}")
 
                 # Create a merged backup for each computer
                 self.log(f"\nCreating synced backups...")
@@ -668,6 +890,65 @@ class MergeWorker:
             self.log(f"\nError: {e}")
             self.finished(False, [])
 
+    def _add_orphan_assistant_to_merged(self, merged_data: dict, orphan: dict):
+        """Add an orphan assistant to the merged data."""
+        local = merged_data.get("localStorage", {})
+        persist_raw = local.get("persist:cherry-studio", "{}")
+        persist = json.loads(persist_raw) if isinstance(persist_raw, str) else persist_raw
+
+        assistants_raw = persist.get("assistants")
+        if assistants_raw:
+            assistants = json.loads(assistants_raw) if isinstance(assistants_raw, str) else assistants_raw
+        else:
+            assistants = {"assistants": []}
+
+        # Add the orphan to the assistants list
+        assistants.setdefault("assistants", []).append(orphan)
+
+        # Save back
+        if isinstance(assistants_raw, str):
+            persist["assistants"] = json.dumps(assistants)
+        else:
+            persist["assistants"] = assistants
+
+        if isinstance(persist_raw, str):
+            local["persist:cherry-studio"] = json.dumps(persist)
+        else:
+            local["persist:cherry-studio"] = persist
+
+        merged_data["localStorage"] = local
+
+    def _add_orphan_topic_to_merged(self, merged_data: dict, topic: dict, assistant_id: str):
+        """Add an orphan topic to the specified assistant in merged data."""
+        local = merged_data.get("localStorage", {})
+        persist_raw = local.get("persist:cherry-studio", "{}")
+        persist = json.loads(persist_raw) if isinstance(persist_raw, str) else persist_raw
+
+        assistants_raw = persist.get("assistants")
+        if not assistants_raw:
+            return  # No assistants to add topic to
+
+        assistants = json.loads(assistants_raw) if isinstance(assistants_raw, str) else assistants_raw
+
+        # Find the assistant and add the topic
+        for asst in assistants.get("assistants", []):
+            if asst.get("id") == assistant_id:
+                asst.setdefault("topics", []).append(topic)
+                break
+
+        # Save back
+        if isinstance(assistants_raw, str):
+            persist["assistants"] = json.dumps(assistants)
+        else:
+            persist["assistants"] = assistants
+
+        if isinstance(persist_raw, str):
+            local["persist:cherry-studio"] = json.dumps(persist)
+        else:
+            local["persist:cherry-studio"] = persist
+
+        merged_data["localStorage"] = local
+
 
 class MergeGUI:
     """Graphical user interface for Cherry Studio Sync using PySide6."""
@@ -676,7 +957,8 @@ class MergeGUI:
         from PySide6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
             QLabel, QLineEdit, QPushButton, QCheckBox, QGroupBox, QTextEdit,
-            QFileDialog, QMessageBox, QSpinBox
+            QFileDialog, QMessageBox, QSpinBox, QDialog, QDialogButtonBox,
+            QListWidget, QListWidgetItem, QAbstractItemView
         )
         from PySide6.QtCore import Qt, QThread, Signal, QObject
         from PySide6.QtGui import QIcon
@@ -685,8 +967,11 @@ class MergeGUI:
         class WorkerSignals(QObject):
             log_message = Signal(str)
             finished = Signal(bool, object)
+            orphans_found = Signal(list, list)  # Signal: (assistant_orphans, topic_orphans)
 
         self.signals = WorkerSignals()
+        self.orphan_event = threading.Event()  # For worker to wait on
+        self.current_worker = None  # Reference to current worker for orphan response
 
         self.QApplication = QApplication
         self.QMainWindow = QMainWindow
@@ -702,6 +987,11 @@ class MergeGUI:
         self.QFileDialog = QFileDialog
         self.QMessageBox = QMessageBox
         self.QSpinBox = QSpinBox
+        self.QDialog = QDialog
+        self.QDialogButtonBox = QDialogButtonBox
+        self.QListWidget = QListWidget
+        self.QListWidgetItem = QListWidgetItem
+        self.QAbstractItemView = QAbstractItemView
         self.Qt = Qt
         self.QThread = QThread
         self.Signal = Signal
@@ -726,6 +1016,7 @@ class MergeGUI:
         # Connect signals to slots for thread-safe GUI updates
         self.signals.log_message.connect(self._log_slot)
         self.signals.finished.connect(self._finish_merge)
+        self.signals.orphans_found.connect(self._show_orphan_dialog)
 
     def _setup_ui(self):
         """Set up the user interface components."""
@@ -818,6 +1109,129 @@ class MergeGUI:
         """Emit finished signal (thread-safe, can be called from any thread)."""
         self.signals.finished.emit(success, output_files)
 
+    def _emit_orphans(self, asst_orphans: list, topic_orphans: list):
+        """Emit orphans signal (thread-safe, can be called from any thread)."""
+        self.signals.orphans_found.emit(asst_orphans, topic_orphans)
+
+    def _show_orphan_dialog(self, asst_orphans: list, topic_orphans: list):
+        """Show dialog for user to decide which orphan items to keep/delete."""
+        dialog = self.QDialog(self.window)
+        dialog.setWindowTitle("Review Items")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+
+        layout = self.QVBoxLayout(dialog)
+
+        # Explanation
+        total = len(asst_orphans) + len(topic_orphans)
+        label = self.QLabel(
+            f"Found {total} item(s) that exist in one backup but not another.\n"
+            "Check the ones you want to KEEP. Unchecked will be ignored.\n"
+            "(Ignored items won't appear in future syncs.)"
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        # Create list widget for all items
+        list_widget = self.QListWidget()
+        list_widget.setSelectionMode(self.QAbstractItemView.SelectionMode.NoSelection)
+
+        # Add assistant orphans
+        if asst_orphans:
+            header = self.QListWidgetItem(f"--- Assistants ({len(asst_orphans)}) ---")
+            header.setFlags(self.Qt.ItemFlag.NoItemFlags)  # Not selectable/checkable
+            list_widget.addItem(header)
+
+            for orphan in asst_orphans:
+                name = orphan.get("name", orphan.get("id", "Unknown Assistant"))
+                topic_count = len(orphan.get("topics", []))
+                item = self.QListWidgetItem(f"  {name} ({topic_count} conversation(s))")
+                item.setFlags(item.flags() | self.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(self.Qt.CheckState.Checked)  # Default to keep
+                item.setData(self.Qt.ItemDataRole.UserRole, ("assistant", orphan.get("id")))
+                list_widget.addItem(item)
+
+        # Add topic orphans
+        if topic_orphans:
+            header = self.QListWidgetItem(f"--- Conversations ({len(topic_orphans)}) ---")
+            header.setFlags(self.Qt.ItemFlag.NoItemFlags)  # Not selectable/checkable
+            list_widget.addItem(header)
+
+            for orphan_info in topic_orphans:
+                topic = orphan_info["topic"]
+                asst_name = orphan_info["assistant_name"]
+                topic_name = topic.get("name", topic.get("id", "Unknown"))
+                item = self.QListWidgetItem(f"  {topic_name} (in {asst_name})")
+                item.setFlags(item.flags() | self.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(self.Qt.CheckState.Checked)  # Default to keep
+                item.setData(self.Qt.ItemDataRole.UserRole, ("topic", topic.get("id")))
+                list_widget.addItem(item)
+
+        layout.addWidget(list_widget)
+
+        # Buttons
+        button_box = self.QDialogButtonBox(
+            self.QDialogButtonBox.StandardButton.Ok | self.QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec() == self.QDialog.DialogCode.Accepted:
+            # Collect user decisions
+            keep_asst_ids = []
+            delete_asst_ids = []
+            keep_topic_ids = []
+            delete_topic_ids = []
+
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                data = item.data(self.Qt.ItemDataRole.UserRole)
+                if data is None:
+                    continue  # Header item
+
+                item_type, item_id = data
+                if item.checkState() == self.Qt.CheckState.Checked:
+                    if item_type == "assistant":
+                        keep_asst_ids.append(item_id)
+                    else:
+                        keep_topic_ids.append(item_id)
+                else:
+                    if item_type == "assistant":
+                        delete_asst_ids.append(item_id)
+                    else:
+                        delete_topic_ids.append(item_id)
+
+            # Save deleted IDs to config with timestamp
+            now = datetime.now().isoformat()
+            if "deleted_assistants" not in self.config:
+                self.config["deleted_assistants"] = {}
+            if "deleted_topics" not in self.config:
+                self.config["deleted_topics"] = {}
+
+            for asst_id in delete_asst_ids:
+                self.config["deleted_assistants"][asst_id] = now
+            for topic_id in delete_topic_ids:
+                self.config["deleted_topics"][topic_id] = now
+            save_config(self.config)
+
+            # Tell worker the decision
+            if self.current_worker:
+                self.current_worker.orphan_response = {
+                    "keep_assistants": keep_asst_ids,
+                    "keep_topics": keep_topic_ids,
+                }
+        else:
+            # User cancelled - keep all to be safe
+            if self.current_worker:
+                self.current_worker.orphan_response = {
+                    "keep_assistants": [o.get("id") for o in asst_orphans],
+                    "keep_topics": [o["topic"].get("id") for o in topic_orphans],
+                }
+
+        # Signal worker to continue
+        self.orphan_event.set()
+
     def _clear_log(self):
         """Clear the log area."""
         self.log_text.clear()
@@ -837,8 +1251,22 @@ class MergeGUI:
         skip_kb = self.skip_kb_cb.isChecked()
         prune_count = self.prune_spin.value() if self.prune_cb.isChecked() else None
 
-        worker = MergeWorker(directory, merge_all, skip_kb, prune_count,
-                           self._emit_log, self._emit_finished)
+        # Get deleted IDs from config
+        deleted_assistant_ids = set(self.config.get("deleted_assistants", {}).keys())
+        deleted_topic_ids = set(self.config.get("deleted_topics", {}).keys())
+
+        # Reset orphan handling state
+        self.orphan_event.clear()
+
+        worker = MergeWorker(
+            directory, merge_all, skip_kb, prune_count,
+            self._emit_log, self._emit_finished,
+            deleted_assistant_ids=deleted_assistant_ids,
+            deleted_topic_ids=deleted_topic_ids,
+            orphan_callback=self._emit_orphans,
+            orphan_event=self.orphan_event
+        )
+        self.current_worker = worker
         thread = threading.Thread(target=worker.run, daemon=True)
         thread.start()
 
@@ -1006,8 +1434,32 @@ def main():
             info = extract_backup(path, temp_dir)
             backup_infos.append(info)
 
-        # Merge all data
-        merged_data, machine_settings = merge_all_backups(backup_infos, stats)
+        # Merge all data (CLI mode: load deleted_ids from config, keep all orphans)
+        config = load_config()
+        deleted_assistant_ids = set(config.get("deleted_assistants", {}).keys())
+        deleted_topic_ids = set(config.get("deleted_topics", {}).keys())
+        merged_data, machine_settings, asst_orphans, topic_orphans = merge_all_backups(
+            backup_infos, stats, deleted_assistant_ids, deleted_topic_ids
+        )
+
+        # In CLI mode, keep all orphans (union behavior)
+        if asst_orphans:
+            print(f"\nFound {len(asst_orphans)} orphan assistant(s), keeping all:")
+            for orphan in asst_orphans:
+                name = orphan.get("name", orphan.get("id", "Unknown"))
+                print(f"  - {name}")
+                _add_orphan_assistant_to_merged_cli(merged_data, orphan)
+
+        if topic_orphans:
+            print(f"\nFound {len(topic_orphans)} orphan conversation(s), keeping all:")
+            for orphan_info in topic_orphans:
+                topic = orphan_info["topic"]
+                asst_name = orphan_info["assistant_name"]
+                topic_name = topic.get("name", topic.get("id", "Unknown"))
+                print(f"  - {topic_name} (in {asst_name})")
+                _add_orphan_topic_to_merged_cli(
+                    merged_data, topic, orphan_info["assistant_id"]
+                )
 
         # Create a merged backup for each computer
         print(f"\nCreating synced backups...")
